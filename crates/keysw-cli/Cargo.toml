@@ -1,0 +1,14 @@
+[package]
+name = "keysw-cli"
+description = "Try the KeySW engine from the terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "keysw"
+path = "src/main.rs"
+
+[dependencies]
+keysw-core = { path = "../keysw-core" }
