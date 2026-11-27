@@ -5,6 +5,8 @@
 
 #[cfg(windows)]
 mod app;
+#[cfg(windows)]
+mod autostart;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod keymap;
 

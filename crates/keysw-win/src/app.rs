@@ -2,17 +2,18 @@
 //! core [`Session`]; its actions are replayed with `SendInput`; a tray icon
 //! turns the app on and off.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use keysw_core::{key_char, Action, Key, Lang, Response, Session};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    GetLastError, ERROR_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT,
+    POINT, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, GetKeyboardLayout, GetKeyboardLayoutList, SendInput, HKL, INPUT,
     INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
@@ -25,12 +26,16 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::autostart;
 use crate::keymap::{lang_to_primary_langid, langid_to_lang, scan_to_base};
 
 const WM_APP_RUN: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
+const WM_APP_FIRST_RUN: u32 = WM_APP + 3;
 const ID_TOGGLE: usize = 1;
 const ID_EXIT: usize = 2;
+const ID_AUTOSTART: usize = 3;
+const ID_ELEVATE: usize = 4;
 /// After we switch the layout ourselves, the foreground window may report
 /// the old one for a moment; trust our switch for this long.
 const SWITCH_GRACE: Duration = Duration::from_millis(600);
@@ -49,6 +54,18 @@ struct State {
 
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    static INSTANCE: Cell<Option<HANDLE>> = const { Cell::new(None) };
+    static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Let a new copy of KeySW start (before restarting ourselves).
+fn release_instance() {
+    if let Some(h) = INSTANCE.with(|m| m.take()) {
+        unsafe {
+            let _ = ReleaseMutex(h);
+            let _ = CloseHandle(h);
+        }
+    }
 }
 
 fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
@@ -58,10 +75,11 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
 pub fn run() {
     unsafe {
         // One copy at a time.
-        let _mutex = CreateMutexW(None, true, w!("KeySW.SingleInstance"));
+        let mutex = CreateMutexW(None, true, w!("KeySW.SingleInstance")).unwrap_or_default();
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return;
         }
+        INSTANCE.with(|m| m.set(Some(mutex)));
 
         let hinstance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
         let class = w!("KeySWWindow");
@@ -101,7 +119,16 @@ pub fn run() {
         });
         with_state(sync_layout);
 
+        // When KeySW runs as administrator, Windows blocks messages from
+        // Explorer (tray clicks) unless we allow them explicitly.
+        let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
+        TASKBAR_CREATED.with(|c| c.set(taskbar_created));
+        for m in [WM_APP_TRAY, taskbar_created, WM_COMMAND] {
+            let _ = ChangeWindowMessageFilterEx(hwnd, m, MSGFLT_ALLOW, None);
+        }
+
         tray(hwnd, NIM_ADD, true);
+        let _ = PostMessageW(Some(hwnd), WM_APP_FIRST_RUN, WPARAM(0), LPARAM(0));
 
         let kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), Some(hinstance), 0)
             .expect("keyboard hook");
@@ -375,15 +402,7 @@ fn wide<const N: usize>(s: &str) -> [u16; N] {
 
 fn tray(hwnd: HWND, op: windows::Win32::UI::Shell::NOTIFY_ICON_MESSAGE, enabled: bool) {
     unsafe {
-        let icon = LoadIconW(
-            None,
-            if enabled {
-                IDI_APPLICATION
-            } else {
-                IDI_WARNING
-            },
-        )
-        .unwrap_or_default();
+        let icon = app_icon(if enabled { 1 } else { 2 });
         let tip = if enabled {
             "KeySW: увімкнено (двічі Shift — скасувати заміну)"
         } else {
@@ -400,6 +419,110 @@ fn tray(hwnd: HWND, op: windows::Win32::UI::Shell::NOTIFY_ICON_MESSAGE, enabled:
             ..Default::default()
         };
         let _ = Shell_NotifyIconW(op, &data);
+    }
+}
+
+/// Icon from the exe's resources (1 = on, 2 = off), at the tray's size.
+fn app_icon(id: u16) -> HICON {
+    unsafe {
+        let hinstance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
+        let cx = GetSystemMetrics(SM_CXSMICON);
+        let cy = GetSystemMetrics(SM_CYSMICON);
+        match LoadImageW(
+            Some(hinstance),
+            PCWSTR(id as usize as *const u16),
+            IMAGE_ICON,
+            cx,
+            cy,
+            LR_DEFAULTCOLOR,
+        ) {
+            Ok(h) => HICON(h.0),
+            Err(_) => LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+        }
+    }
+}
+
+fn message_box(hwnd: HWND, text: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
+    let text = windows::core::HSTRING::from(text);
+    unsafe { MessageBoxW(Some(hwnd), &text, w!("KeySW"), style | MB_SETFOREGROUND) }
+}
+
+/// Saved in %APPDATA%\KeySW: we only ask about autostart once.
+fn settings_path() -> std::path::PathBuf {
+    let base = std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("KeySW").join("asked-autostart")
+}
+
+fn first_run(hwnd: HWND) {
+    let marker = settings_path();
+    if marker.exists() || autostart::is_enabled() {
+        return;
+    }
+    if let Some(dir) = marker.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&marker, "1");
+    let answer = message_box(
+        hwnd,
+        "Запускати KeySW автоматично під час входу в Windows?\n\n\
+         Програма запускатиметься з правами адміністратора, щоб перемикати розкладку \
+         і у вікнах, відкритих від адміністратора. Windows один раз попросить дозвіл.\n\n\
+         Змінити це можна будь-коли в меню значка в треї.",
+        MB_YESNO | MB_ICONQUESTION,
+    );
+    if answer == IDYES {
+        enable_autostart(hwnd);
+    }
+}
+
+fn enable_autostart(hwnd: HWND) {
+    match autostart::enable() {
+        Ok(()) => {
+            if autostart::is_elevated() {
+                return;
+            }
+            // Switch to the elevated copy right away, so admin windows work now.
+            release_instance();
+            if autostart::start_task() {
+                unsafe { PostQuitMessage(0) };
+            }
+        }
+        Err(e) => {
+            message_box(
+                hwnd,
+                &format!("Не вдалося ввімкнути автозапуск: {e}"),
+                MB_OK | MB_ICONWARNING,
+            );
+        }
+    }
+}
+
+fn restart_elevated(hwnd: HWND) {
+    release_instance();
+    if autostart::is_enabled() && autostart::start_task() {
+        unsafe { PostQuitMessage(0) };
+        return;
+    }
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let file = windows::core::HSTRING::from(exe);
+    let ok = unsafe {
+        windows::Win32::UI::Shell::ShellExecuteW(
+            Some(hwnd),
+            w!("runas"),
+            &file,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    }
+    .0 as isize
+        > 32;
+    if ok {
+        unsafe { PostQuitMessage(0) };
     }
 }
 
@@ -426,6 +549,26 @@ fn show_menu(hwnd: HWND) {
             w!("Скасувати заміну: двічі Shift"),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let auto = if autostart::is_enabled() {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING | auto,
+            ID_AUTOSTART,
+            w!("Запускати з Windows (з правами адміністратора)"),
+        );
+        if !autostart::is_elevated() {
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                ID_ELEVATE,
+                w!("Перезапустити з правами адміністратора"),
+            );
+        }
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Вихід"));
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
@@ -444,6 +587,20 @@ fn show_menu(hwnd: HWND) {
         match cmd.0 as usize {
             ID_TOGGLE => toggle(hwnd),
             ID_EXIT => PostQuitMessage(0),
+            ID_AUTOSTART => {
+                if autostart::is_enabled() {
+                    if let Err(e) = autostart::disable() {
+                        message_box(
+                            hwnd,
+                            &format!("Не вдалося вимкнути автозапуск: {e}"),
+                            MB_OK | MB_ICONWARNING,
+                        );
+                    }
+                } else {
+                    enable_autostart(hwnd);
+                }
+            }
+            ID_ELEVATE => restart_elevated(hwnd),
             _ => {}
         }
     }
@@ -458,6 +615,16 @@ unsafe extern "system" fn wnd_proc(
     match msg {
         WM_APP_RUN => {
             run_pending();
+            LRESULT(0)
+        }
+        WM_APP_FIRST_RUN => {
+            first_run(hwnd);
+            LRESULT(0)
+        }
+        m if m != 0 && m == TASKBAR_CREATED.with(Cell::get) => {
+            // Explorer restarted: put the tray icon back.
+            let enabled = with_state(|st| st.enabled).unwrap_or(true);
+            tray(hwnd, NIM_ADD, enabled);
             LRESULT(0)
         }
         WM_APP_TRAY => {

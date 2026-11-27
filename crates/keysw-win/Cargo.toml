@@ -10,6 +10,7 @@ repository.workspace = true
 name = "keysw-win"
 path = "src/main.rs"
 
+
 [dependencies]
 keysw-core = { path = "../keysw-core" }
 
@@ -21,9 +22,13 @@ features = [
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_TextServices",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+[build-dependencies]
+embed-resource = "3"
