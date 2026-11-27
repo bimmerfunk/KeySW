@@ -18,7 +18,9 @@ mod buffer;
 mod engine;
 mod layout;
 mod model;
+mod session;
 
 pub use buffer::WordBuffer;
 pub use engine::{Config, Correction, Engine};
 pub use layout::{char_key, convert, key_char, keys_from_en, render, Key, Lang};
+pub use session::{Action, Response, Session, DOUBLE_SHIFT_MS};

@@ -145,6 +145,9 @@ impl Engine {
         let alt_core = normalize(core(&replacement));
         let cur = self.model(from);
         let alt = self.model(to);
+        if self.config.exceptions.contains(&cur_core) {
+            return None;
+        }
 
         let n = alt_core.chars().count();
         if !alt.is_spellable(&alt_core) {
@@ -177,10 +180,6 @@ impl Engine {
         if lost_letters_before_end(&original, &replacement) {
             return None;
         }
-        if self.config.exceptions.contains(&cur_core) {
-            return None;
-        }
-
         // If punctuation around the typed word becomes letters (];fr -> їжак),
         // the typed "word" is just a fragment, so a dictionary hit means nothing.
         let fragment = letters(&replacement) > letters(&original);

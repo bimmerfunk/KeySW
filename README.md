@@ -11,6 +11,7 @@
 - Українська / російська → англійська.
 - Рішення приймається для кожного слова після пробілу: спершу словник (30 000 найчастіших слів кожної мови), потім статистика сполучень літер (триграми), щоб розпізнавати й слова, яких немає в словнику.
 - Не чіпає слова з цифрами, змішаний регістр (`iPhone`), одиночні літери та поширені скорочення (`db`, `ui`, `ok` …).
+- **Скасування автозаміни: двічі швидко натисніть Shift** одразу після виправлення. Повернеться набране слово і попередня розкладка, і до кінця сеансу це слово більше не виправлятиметься. Опційно можна ввімкнути скасування клавішею Backspace.
 - Усе працює локально, набраний текст нікуди не надсилається.
 
 ## Стан
@@ -52,7 +53,8 @@ cargo run --release -p keysw-core --example eval -- en words_en.txt uk words_uk.
 ## English
 
 KeySW watches what you type and, when a word was clearly typed in the wrong layout,
-replaces it and switches the layout. English-layout mistakes go to whichever Cyrillic
+replaces it and switches the layout. Double-tap Shift right after a correction to
+undo it (the word is then left alone for the rest of the session). English-layout mistakes go to whichever Cyrillic
 layout (Ukrainian or Russian) you used last; Cyrillic-layout mistakes go to English.
 
 The core engine (`crates/keysw-core`) is pure Rust with no OS dependencies: a
