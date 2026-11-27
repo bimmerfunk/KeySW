@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/keysw-core", "crates/keysw-cli"]
+members = ["crates/keysw-core", "crates/keysw-cli", "crates/keysw-win"]
 
 [workspace.package]
 version = "0.1.0"
